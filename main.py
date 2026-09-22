@@ -28,6 +28,8 @@ DEFAULT_GAUGE_DESCRIPTIONS = {
     4: "M4",
     5: "M5",
     6: "M6",
+    7: "M7",
+    8: "M8",
 }
 
 
@@ -413,16 +415,16 @@ def main():
 
     try:
         sensor_sel = input(
-            "Enter sensor addresses to use (1–6). Examples: 4,5,6 | 1 4 6 | 1-3,6 | 'all'\n"
+            "Enter sensor addresses to use (1–8). Examples: 4,5,6 | 1 4 8 | 1-3,8 | 'all'\n"
             "Leave blank to select by count (first N sensors): "
         ).strip()
 
         if sensor_sel:
             gauge_addresses = parse_sensor_selection(sensor_sel)
         else:
-            num_sensors = int(input("Enter number of sensors to use (1–6): "))
-            if not 1 <= num_sensors <= 6:
-                raise ValueError("Sensor count must be between 1 and 6.")
+            num_sensors = int(input("Enter number of sensors to use (1–8): "))
+            if not 1 <= num_sensors <= 8:
+                raise ValueError("Sensor count must be between 1 and 8.")
             gauge_addresses = list(DEFAULT_GAUGE_DESCRIPTIONS.keys())[:num_sensors]
 
         freq_input = input("Enter frequency in Hz (0.001–100): ").strip()
