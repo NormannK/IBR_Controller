@@ -181,3 +181,15 @@ My_Setup.ddk
 
 # Ignore messaging script
 notify.py
+
+# IBR proprietary runtime, driver, firmware, and setup files
+# Obtain these from IBR and install them locally; do not commit them.
+ibr_ddk.dll
+ibrddk_*.dll
+IBR_DDK.USD
+IBR_IO.CAT
+DDKHelper.exe
+IBR_ComGage_Control.DLL
+IMB-Firmware*.dat
+IMB-SM*.DRV
+*.ddk
