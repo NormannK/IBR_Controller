@@ -42,7 +42,13 @@ class SensorSelectionTests(unittest.TestCase):
 
     def test_invalid_sensor_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Invalid sensor"):
-            main.parse_sensor_selection("1,7")
+            main.parse_sensor_selection("1,9")
+
+    def test_all_default_sensors_includes_imb_im8_channels(self):
+        self.assertEqual(main.parse_sensor_selection("all"), list(range(1, 9)))
+
+    def test_channels_seven_and_eight_are_selectable(self):
+        self.assertEqual(main.parse_sensor_selection("7,8"), [7, 8])
 
     def test_empty_selection_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "cannot be empty"):
