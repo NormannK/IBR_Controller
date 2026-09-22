@@ -6,7 +6,7 @@ import traceback
 from ctypes import c_short, c_double, c_char_p, POINTER, byref
 from ctypes import wintypes
 
-# CALLBACK == __stdcall
+# CALLBACK == __stdcall (unused here but kept for completeness / future streaming API)
 DDK_FctPtr = ctypes.WINFUNCTYPE(
     None,              # void
     c_short,           # devicenr
@@ -17,23 +17,21 @@ DDK_FctPtr = ctypes.WINFUNCTYPE(
 )
 
 # ---- define missing Win32 types (some Python builds omit these in wintypes) ----
-# LRESULT is a LONG_PTR (signed pointer-sized integer)
 if ctypes.sizeof(ctypes.c_void_p) == 8:
     LRESULT = ctypes.c_longlong
 else:
     LRESULT = ctypes.c_long
 
-# Win32 DLLs (needed for the hidden message window + pump)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 PM_REMOVE = 0x0001
 ERROR_CLASS_ALREADY_EXISTS = 1410
 
-
 WNDPROCTYPE = ctypes.WINFUNCTYPE(
     LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
 )
+
 
 class WNDCLASSEXW(ctypes.Structure):
     _fields_ = [
@@ -51,8 +49,10 @@ class WNDCLASSEXW(ctypes.Structure):
         ("hIconSm", wintypes.HICON),
     ]
 
+
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
 
 class MSG(ctypes.Structure):
     _fields_ = [
@@ -64,34 +64,46 @@ class MSG(ctypes.Structure):
         ("pt", POINT),
     ]
 
+
 # Prototypes used by the pump
 user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
-user32.RegisterClassExW.restype  = wintypes.ATOM
+user32.RegisterClassExW.restype = wintypes.ATOM
 
 user32.CreateWindowExW.argtypes = [
-    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID
+    wintypes.DWORD,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.HWND,
+    wintypes.HMENU,
+    wintypes.HINSTANCE,
+    wintypes.LPVOID,
 ]
 user32.CreateWindowExW.restype = wintypes.HWND
 
 user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-user32.DefWindowProcW.restype  = LRESULT
+user32.DefWindowProcW.restype = LRESULT
 
-user32.PeekMessageW.argtypes   = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
-user32.PeekMessageW.restype    = wintypes.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
 
 user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
-user32.TranslateMessage.restype  = wintypes.BOOL
+user32.TranslateMessage.restype = wintypes.BOOL
 
-user32.DispatchMessageW.argtypes  = [ctypes.POINTER(MSG)]
-user32.DispatchMessageW.restype   = LRESULT
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+user32.DispatchMessageW.restype = LRESULT
 
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-kernel32.GetModuleHandleW.restype  = wintypes.HINSTANCE
+kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
 
 
 class IbrDll:
+    """Thin ctypes wrapper with a lightweight message pump + a faster multi-read helper."""
+
     def __init__(self, dll_path: str):
         self.initialized = False
 
@@ -100,8 +112,10 @@ class IbrDll:
         self._dll_dir = os.path.dirname(dll_path)
 
         # Ensure the DLL + its dependencies are discoverable
+        self._dll_dir_handle = None
         if hasattr(os, "add_dll_directory"):
-            os.add_dll_directory(self._dll_dir)
+            # The returned handle must stay alive or Windows removes the search path.
+            self._dll_dir_handle = os.add_dll_directory(self._dll_dir)
         os.environ["PATH"] = self._dll_dir + os.pathsep + os.environ.get("PATH", "")
 
         # IMPORTANT: __stdcall DLL => WinDLL
@@ -112,7 +126,7 @@ class IbrDll:
         self.Device_Init.restype = c_short
         self.Device_Init.argtypes = [c_short, c_char_p, wintypes.HWND, wintypes.HWND]
 
-        # Optional export (but your minimal.py checks it, so we do too)
+        # Optional export
         if hasattr(self.dll, "Device_PreInit"):
             self.Device_PreInit = self.dll.Device_PreInit
             self.Device_PreInit.restype = None
@@ -132,8 +146,8 @@ class IbrDll:
         self.Device_DeInit.restype = c_short
         self.Device_DeInit.argtypes = []
 
-        # Keep wndproc callable alive (avoid GC)
         self._wndproc_ref = None
+        self._msg = MSG()  # reusable
 
     def get_version(self) -> tuple[int, int]:
         major = c_short()
@@ -142,18 +156,14 @@ class IbrDll:
         return major.value, minor.value
 
     def _create_hidden_message_window(self) -> wintypes.HWND:
-        """
-        Create a hidden Win32 window on the *calling thread* so we can pump messages
-        while Device_Init runs on a worker thread (prevents DLL init deadlock).
-        """
-        class_name = f"IBR_DDK_PY_MSGWND_{os.getpid()}"
+        # Each instance needs its own class because the class owns the WNDPROC callback.
+        class_name = f"IBR_DDK_PY_MSGWND_{os.getpid()}_{id(self):x}"
 
         @WNDPROCTYPE
         def wndproc(hwnd, msg, wparam, lparam):
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-        self._wndproc_ref = wndproc  # keep alive
-
+        self._wndproc_ref = wndproc
         hinst = kernel32.GetModuleHandleW(None)
 
         wc = WNDCLASSEXW()
@@ -173,57 +183,40 @@ class IbrDll:
         atom = user32.RegisterClassExW(ctypes.byref(wc))
         if not atom:
             err = ctypes.get_last_error()
-            # OK if class already exists in this process (unlikely with PID suffix, but safe)
             if err != ERROR_CLASS_ALREADY_EXISTS:
                 raise OSError(f"RegisterClassExW failed: {err} / {ctypes.FormatError(err).strip()}")
 
-        hwnd = user32.CreateWindowExW(
-            0, class_name, "IBRHidden", 0,
-            0, 0, 0, 0,
-            0, 0, hinst, None
-        )
+        hwnd = user32.CreateWindowExW(0, class_name, "IBRHidden", 0, 0, 0, 0, 0, 0, 0, hinst, None)
         if not hwnd:
             err = ctypes.get_last_error()
             raise OSError(f"CreateWindowExW failed: {err} / {ctypes.FormatError(err).strip()}")
 
         return hwnd
 
-    def init_device(self, setup_filename: str, *, timeout_s: float = 30.0, imb_control: int = 1) -> int:
-        """
-        Initialize device without hanging:
-        - Create hidden message window
-        - Call Device_Init in worker thread
-        - Pump messages on calling thread until completion or timeout
+    def pump_messages(self, *, limit: int = 50) -> int:
+        """Pump Win32 messages on the current thread. Cheap; helps DLLs that signal via messages."""
+        n = 0
+        while n < int(limit) and user32.PeekMessageW(ctypes.byref(self._msg), 0, 0, 0, PM_REMOVE):
+            user32.TranslateMessage(ctypes.byref(self._msg))
+            user32.DispatchMessageW(ctypes.byref(self._msg))
+            n += 1
+        return n
 
-        Returns:
-          0 on success (also treats -1 as success per your previous wrapper behavior),
-          nonzero error code on failure,
-          124 on timeout.
-        """
-        # Match IMB_Test.exe-ish environment: run from DLL folder during init
+    def init_device(self, setup_filename: str, *, timeout_s: float = 30.0, imb_control: int = 1) -> int:
         prev_cwd = os.getcwd()
         try:
             os.chdir(self._dll_dir)
         except Exception:
-            # If chdir fails, continue; message pump fix is still the key
             pass
 
         try:
-            # PreInit (use IMB control mode by default, as in minimal.py)
             if self.Device_PreInit is not None:
-                # signature: (InitTimes, ?, ?, IMB_Control, ?, ?, ?)
-                # minimal.py uses: (1,0,0, IMB_CONTROL,0,0,0)
-                self.Device_PreInit(c_short(1), c_short(0), c_short(0),
-                                    c_short(int(imb_control)),
-                                    c_short(0), c_short(0), c_short(0))
+                self.Device_PreInit(c_short(1), c_short(0), c_short(0), c_short(int(imb_control)), c_short(0), c_short(0), c_short(0))
 
             language = c_short(1)
-
-            # Win32 char* API: use Windows ANSI codepage
             setup_bytes = os.fspath(setup_filename).encode("mbcs")
             setup_c = c_char_p(setup_bytes)
 
-            # Hidden message window on this thread
             hwnd = self._create_hidden_message_window()
             parent = wintypes.HWND(hwnd)
             wh = wintypes.HWND(hwnd)
@@ -243,39 +236,49 @@ class IbrDll:
             t = threading.Thread(target=init_thread, daemon=True)
             t.start()
 
-            msg = MSG()
             start = time.time()
-
-            # Pump until init completes or times out
             while not done.is_set():
-                while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
-                    user32.TranslateMessage(ctypes.byref(msg))
-                    user32.DispatchMessageW(ctypes.byref(msg))
-
+                self.pump_messages(limit=200)
                 if timeout_s is not None and (time.time() - start) > float(timeout_s):
-                    # Timeout - avoid infinite hang
                     return 124
-
                 time.sleep(0.01)
 
             if result["exc"]:
-                # Surface details via error code; caller can log/print if desired
-                # (If you prefer raising, change this to: raise RuntimeError(result["exc"]))
                 return 998
 
             rc = int(result["rc"]) if result["rc"] is not None else 999
-
-            # Preserve your prior convention: rc 0 or -1 => "success"
             if rc in (0, -1):
                 self.initialized = True
                 return 0
             return rc
-
         finally:
             try:
                 os.chdir(prev_cwd)
             except Exception:
                 pass
+
+    def make_fast_reader(self, devicenr: int, addresses: list[int]):
+        """
+        Create a high-throughput reader for a fixed device + address list.
+        Avoids per-call ctypes allocations seen in get_value().
+
+        Returns a callable: () -> (rcs: list[int], vals: list[float])
+        """
+        dev_c = c_short(int(devicenr))
+        addr_cs = [c_short(int(a)) for a in addresses]
+        vals = [c_double() for _ in addresses]
+        dev_value = self.Device_Value
+
+        def _read_all():
+            rcs = [0] * len(addr_cs)
+            out = [0.0] * len(addr_cs)
+            for i, addr_c in enumerate(addr_cs):
+                rc = int(dev_value(dev_c, addr_c, byref(vals[i])))
+                rcs[i] = rc
+                out[i] = float(vals[i].value)
+            return rcs, out
+
+        return _read_all
 
     def get_value(self, devicenr: int, address: int) -> tuple[int, float]:
         val = c_double()
